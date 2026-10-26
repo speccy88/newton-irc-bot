@@ -1,0 +1,1 @@
+{"servers":{"libera":{"channels":{"#example-channel":true},"host":"irc.libera.chat","port":6697,"tls":true},"oftc":{"channels":{"#example-channel":true},"host":"irc.oftc.net","port":6697,"tls":true}}}

@@ -1,0 +1,41 @@
+# Runtime state — never commit. The database contains other people's
+# IRC messages and the bot's full history; logs/pids/outbox carry live
+# operational data.
+newton.db
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.pid
+outbox*.jsonl
+brain_calls.jsonl
+brain_searches.jsonl
+brain_prompts.jsonl
+drive_backup.json
+day_one_watch.json
+kicked.json
+nick_state.json
+daily_report_latest.txt
+PROGRESS.md
+
+# Live configuration — ship the example, not your own.
+config.json
+
+# Operator secrets / identifiers — never commit.
+.env
+*.env
+operator_denylist.txt
+*.key
+*.pem
+
+# Local survey + operational notes (not part of the reusable bot).
+survey*.md
+survey*.json
+survey*.py
+sync.log
+
+# Backups and build artifacts.
+*.bak
+__pycache__/
+venv/
+.muse-github-snapshot-sync.json
