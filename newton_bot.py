@@ -144,7 +144,7 @@ TOPIC_KEYWORDS = {
     "isa": ["risc-v", "riscv", "arm", "x86", "cpu", "isa",
             "instruction set", "apple silicon"],
     "lang": ["rust", "c++", "python", "javascript", "golang",
-            "haskell", "programming language"],
+             "haskell", "programming language"],
     "linux": ["linux", "kernel", "distro", "ubuntu", "debian", "arch",
               "gentoo", "nixos"],
     "ai": ["llm", "chatgpt", "copilot", "machine learning", "neural",
@@ -661,7 +661,7 @@ async def brain_loop(db, bot_by_net):
                         db, iid, "skipped",
                         skip_reason=decision["skip_reason"])
                     print(f"[brain] {server} {channel}: skipped "
-                          f"(interaction {iid}): {decision[skip_reason]}",
+                          f"(interaction {iid}): {decision['skip_reason']}",
                           flush=True)
                 newton_db.write_interaction_note(
                     db, server, channel, decision["decision"],
