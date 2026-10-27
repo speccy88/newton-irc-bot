@@ -20,7 +20,7 @@ Architecture:
                  context plus the triggering message.
   brain loop (in-process, newton_bot.py brain_loop) — polls the
                  interactions queue, guards spend/caps, and calls the
-                 LangChain ReAct agent (newton_brain.run_agent), which
+                 LangChain tool-calling agent (newton_brain.run_agent), which
                  reasons over the thread and either writes a fresh reply
                  to outbox.jsonl or marks the row skipped with a reason.
   outbox.jsonl + send_outbox.py — the only path words take to IRC.

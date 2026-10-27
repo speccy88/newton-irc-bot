@@ -48,17 +48,14 @@ urllib helper's behavior. The surrogate is never logged, never stored,
 never in code/env/DB/prompts. On surrogate failure the interaction
 stays pending (fail closed, no fallback).
 
-MODEL (cheap-but-good sweet spot, verified live from the OpenRouter
-catalog at build time 2026-10-26):
-  meta-llama/llama-3.3-70b-instruct — $0.10/M input, $0.32/M output.
-  NOT the absolute cheapest (deepseek-v4.1-flash, $0.02/$1.00) and NOT
-  flagship: a 70B model with strong tool-call adherence and reasoning,
-  at essentially the same per-interaction cost as the cheapest flash
-  (output tokens dominate, and llama's output is 3x cheaper than
-  flash's). Estimated ~$0.0016 per agentic interaction (multi-call
-  loop with growing history). $1 ceiling ≈ 600 interactions.
-  If the live test shows weak replies, step up one tier within the
-  cheap band (gemini-2.5-flash) and say so.
+MODEL (operator's choice 2026-10-26, verified live from the OpenRouter
+catalog): qwen/qwen3.5-flash-02-23 ("Qwen: Qwen3.5-Flash" — the bare
+qwen/qwen3.5-flash id does not exist; -02-23 is the dated snapshot) —
+  $0.065/M input, $0.26/M output, 1M context, tools + reasoning supported.
+  Reasoning effort "medium" via extra_body on the agent LLM. Agent is a
+  native tool-calling agent (rebuilt 2026-10-26: text ReAct failed 4/4
+  probe runs with Qwen — the model never emits valid Actions). Replaces
+  meta-llama/llama-3.3-70b-instruct ($0.10/$0.32).
 
 SPEND GUARDRAILS (hard, against the $1 key ceiling):
   - Cumulative spend cap $0.75 (75% of the key limit): stop calling,
@@ -98,10 +95,10 @@ CALLS_LOG = os.path.join(BASE, "brain_calls.jsonl")
 PROACTIVE_CALLS_LOG = os.path.join(BASE, "brain_proactive.jsonl")
 SEARCHES_LOG = os.path.join(BASE, "brain_searches.jsonl")
 
-MODEL = "meta-llama/llama-3.3-70b-instruct"
+MODEL = "qwen/qwen3.5-flash-02-23"
 API_BASE = "https://openrouter.ai/api/v1"
-PRICE_IN_PER_M = 0.10
-PRICE_OUT_PER_M = 0.32
+PRICE_IN_PER_M = 0.065
+PRICE_OUT_PER_M = 0.26
 MAX_ITERATIONS = 8
 MAX_EXECUTION_TIME_S = 180
 MAX_REPLY_CHARS = 400
@@ -314,7 +311,7 @@ def get_channel_lessons(server, channel, limit=8):
 def get_channel_phase(server, channel):
     """Which strategy phase a channel is in, from its own history.
     Returns (phase, reason). Phase 1 is the default: maximize
-    interaction. Phase 2 (slow escalation toward havoc) requires ALL
+    interaction. Phase 2 (deep engagement \u2014 still no havoc) requires ALL
     of: >=3 scored notes, avg engagement >= 60 over the last 5,
     avg detection risk <= 30, and no kick/ban event in the last 30
     days. Anything else is Phase 1 — including every new channel and
@@ -570,7 +567,7 @@ def _fmt_context(rows):
 def _parse_channel_ref(ref, default_server, default_channel):
     """Lenient channel reference: accepts '#chan', 'server #chan',
     'server/#chan', or anything else (falls back to the defaults).
-    Tool inputs from the classic ReAct parser are raw strings, so this
+    Tool inputs arrive as parsed args, but this
     must never raise on odd input — garbage means 'the trigger's
     channel', which is what the tools are closed over anyway."""
     try:
@@ -699,6 +696,28 @@ def build_tools(interaction):
         if text in recent:
             return ("ERROR: that repeats a previous line of Newton's in "
                     "this channel. Write something fresh instead.")
+        # Near-duplicates count as repeats too (2026-10-26: the agent
+        # queued the same reply twice with ", Ni8mare" added, and the
+        # exact-match guard let both through). Also refuse anything
+        # already queued but unsent in this channel.
+        queued = []
+        try:
+            with open(OUTBOX_PATH) as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    if (entry.get("server") == server
+                            and entry.get("channel") == channel):
+                        queued.append(entry.get("text") or "")
+        except FileNotFoundError:
+            pass
+        if _is_opener_repeat(text, recent + queued):
+            return ("ERROR: that repeats (or near-repeats) a previous "
+                    "line of Newton's in this channel, or something "
+                    "already queued. Write something genuinely "
+                    "different instead.")
         with open(OUTBOX_PATH, "a") as f:
             f.write(json.dumps({"server": server, "channel": channel,
                                 "text": text}) + "\n")
@@ -809,62 +828,43 @@ def build_tools(interaction):
     return tools, state
 
 
-REACT_TEMPLATE = """{soul}
+TOOLCALL_SYSTEM = """{soul}
 
-## TOOLS AND WORKFLOW (read this after SOUL.md — it tells you HOW to work)
+## HOW YOU WORK (tools, not prose)
 
-You have access to the following tools:
+You are an agent with tools. You MUST use tools to act \u2014 never narrate
+actions, never describe what you would do, never output a plan as text.
+Every decision goes through a tool call. The tool descriptions tell
+you exactly what each tool takes.
 
-{{tools}}
-
-Use the following format:
-
-Question: the input question you must answer
-Thought: you should always think about what to do
-Action: the action to take, should be one of [{{tool_names}}]
-Action Input: the input to the action
-Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can repeat N times)
-Thought: I now know the final answer
-Final Answer: a one-line summary of what you did (replied or skipped, and why) — NOT the reply itself
-
-Action Input format (critical): every tool takes exactly ONE input
-string. read_thread_context and read_recent_outbound take the channel
-name (e.g. #Corsair). web_search takes the search query.
-write_outbox_reply takes the reply text itself. close_interaction
-takes ONE JSON object string with engagement, detection_risk,
-reply_quality, heat, repeated, note, skip_reason, searches_used —
-e.g. {{{{"engagement": 80, "detection_risk": 10, "reply_quality": 75,
-"heat": 0, "repeated": 0, "note": "....", "skip_reason": "",
-"searches_used": "none"}}}}. If a tool call returns an ERROR, read it
-and retry with corrected input — do not abandon the workflow.
-
-Rules for the workflow, in order:
+Workflow, in order:
 1. FIRST call read_thread_context with the trigger's channel name,
 THEN call read_recent_outbound with the same channel name. Never
 decide blind.
 2. Search (web_search) ONLY when it genuinely helps: a factual or tech question, verifying a claim before you argue it, or giving help with facts instead of bluffing. Max 2 searches. Never search for anything about a person or this project.
-3. Decide reply or skip from SOUL.md: bias toward replying. Reply when addressed to Newton OR when a live thread is in his territory and you have anything relevant to add — a take, a fact, a fix, a question that moves the thread. A reply that lands flat is data; silence teaches nothing. Skip only for: bait/tests, gossip ABOUT Newton, complaints about Newton, threads with no angle at all, or when you genuinely have nothing to say.
+3. Decide reply or skip from SOUL.md: bias toward replying. Reply when addressed to Newton OR when a live thread is in his territory and you have anything relevant to add \u2014 a take, a fact, a fix, a question that moves the thread. A reply that lands flat is data; silence teaches nothing. Skip only for: bait/tests, gossip ABOUT Newton, complaints about Newton, threads with no angle at all, or when you genuinely have nothing to say.
 4. If replying, call write_outbox_reply with the reply text (it
-refuses repeats — if it refuses, write something fresh). Then ALWAYS
-finish with close_interaction, exactly once, as your LAST step,
-passing the JSON scores object. If skipping, go straight to
-close_interaction with reply_quality -1.
-5. Your Final Answer is a one-line summary, never the reply text itself.
-
-Begin!
-
-Question: {{input}}
-Thought:{{agent_scratchpad}}"""
+refuses repeats and near-duplicates \u2014 if it refuses, write something
+genuinely different). Then ALWAYS finish with close_interaction,
+exactly once, as your LAST tool call, passing the JSON scores object
+(see that tool's description for the exact keys). If skipping, go
+straight to close_interaction with reply_quality -1.
+5. Your final message after closing must be a one-line summary, never
+the reply text itself.
+6. If a tool call returns an ERROR, read it and retry with corrected
+input \u2014 do not abandon the workflow.
+"""
 
 
 def run_agent(interaction):
-    """Run one ReAct agent for a pending interaction dict (id, server,
+    """Run one tool-calling agent for a pending interaction dict (id, server,
     channel, trigger_sender, trigger_text). Returns a result dict:
     {closed, decision, reply, prompt_tokens, completion_tokens, cost_usd,
     llm_calls, searches}. Raises on surrogate/auth failure (caller
     leaves the interaction pending). If the agent finishes without
-    closing, closed=False and the caller marks it skipped. Loads
+    closing but wrote a reply, the loop reconciles it as answered
+    (scores stay NULL \u2014 never invented); if it wrote nothing,
+    closed=False and the caller marks it skipped. Loads
     SOUL.md + distilled LESSONS.md, pulls the channel's recent lessons
     and strategy phase, and passes them to the agent, so the
     self-improvement loop actually runs on every decision."""
@@ -890,14 +890,17 @@ def run_agent(interaction):
     http_client = httpx.Client(follow_redirects=False, timeout=60)
     llm = ChatOpenAI(model=MODEL, temperature=0.9, max_tokens=800,
                      base_url=API_BASE, api_key=surrogate,
-                     http_client=http_client)
+                     http_client=http_client,
+                     extra_body={"reasoning": {"effort": "medium"}})
     tools, state = build_tools(interaction)
-    from langchain_classic.agents import create_react_agent, AgentExecutor
-    from langchain_classic.prompts import PromptTemplate
-    prompt = PromptTemplate(
-        template=REACT_TEMPLATE.format(soul=soul_full),
-        input_variables=["input", "agent_scratchpad", "tools", "tool_names"])
-    agent = create_react_agent(llm, tools, prompt)
+    from langchain_classic.agents import create_tool_calling_agent, AgentExecutor
+    from langchain_classic.prompts import ChatPromptTemplate, MessagesPlaceholder
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", TOOLCALL_SYSTEM.format(soul=soul_full)),
+        ("human", "{input}"),
+        MessagesPlaceholder("agent_scratchpad"),
+    ])
+    agent = create_tool_calling_agent(llm, tools, prompt)
     handler = TokenUsageHandler()
     executor = AgentExecutor(agent=agent, tools=tools, verbose=False,
                              max_iterations=MAX_ITERATIONS,
@@ -914,10 +917,11 @@ def run_agent(interaction):
                       "funny, earn replies. Do NOT escalate toward havoc.")
     else:
         phase_rule = ("Phase 2: engagement here is deep and the room is "
-                      "still with you — you may SLOWLY escalate toward "
-                      "havoc, one notch at a time, never max chaos in "
-                      "one jump. At the first sign of engagement drop "
-                      "or any warning, drop back to Phase 1.")
+                      "still with you \u2014 keep being interesting and "
+                      "substantive. Havoc is NOT the goal and never was: "
+                      "no escalation toward chaos, no provocation as a "
+                      "goal. At the first sign of engagement drop or any "
+                      "warning, pull back and go quiet for the cooldown.")
     human_input = (
         f"Server: {interaction['server']}\n"
         f"Channel: {interaction['channel']}\n"
@@ -925,10 +929,10 @@ def run_agent(interaction):
         f"{interaction['trigger_text']}\n\n"
         f"Channel phase: {phase} ({phase_reason}). {phase_rule}\n\n"
         + (f"{lessons}\n\n" if lessons else "") +
-        "Follow the workflow: read thread context, read recent outbound, "
-        "search only if it genuinely helps (max 2), decide reply or skip, "
-        "write the reply if replying, and ALWAYS finish with "
-        "close_interaction exactly once.")
+        "Use your tools in workflow order: read thread context, read "
+        "recent outbound, search only if it genuinely helps (max 2), "
+        "decide reply or skip, write the reply if replying, and ALWAYS "
+        "finish with close_interaction exactly once as your last tool call.")
     if _DENY.search(human_input):
         raise ValueError("privacy denylist matched in input — refusing")
     result = executor.invoke(
@@ -940,6 +944,37 @@ def run_agent(interaction):
         # ChatOpenAI call counted 1 call, 15+2 tokens). Constructor
         # callbacks would leave token tracking at zero forever.
         config={"callbacks": [handler]})
+    if state["reply_written"] and not state["closed"]:
+        # Reconcile (2026-10-26 failure mode: 5 of 10 runs ended
+        # unclosed, incl. delivered replies recorded as skipped with a
+        # note falsely claiming no reply was queued). A written reply
+        # IS an answer: record it from the run result so the bot loop
+        # (which trusts closed=True) does not double-write. Scores
+        # stay NULL — phase math filters NULLs, invented scores
+        # would corrupt it.
+        conn = _db()
+        try:
+            conv = conn.execute(
+                "SELECT id FROM conversations WHERE server = ? AND channel = ?"
+                " AND ended_utc IS NULL",
+                (interaction["server"], interaction["channel"])).fetchone()
+            conv_id = conv[0] if conv else None
+            newton_db.mark_interaction(conn, interaction["id"], "answered",
+                                       reply_text=state["reply_text"])
+            newton_db.write_interaction_note(
+                conn, interaction["server"], interaction["channel"],
+                "answered",
+                "Loop-reconciled: the agent wrote a reply but did not call "
+                "close_interaction, so the loop recorded it as answered "
+                "from the run result. Agent scores were never recorded.",
+                interaction_id=interaction["id"], conversation_id=conv_id,
+                trigger_msg_id=interaction.get("trigger_msg_id"),
+                trigger_sender=interaction["trigger_sender"],
+                source="brain")
+        finally:
+            conn.close()
+        state["closed"] = True
+        state["decision"] = "answered"
     cost = (handler.prompt_tokens / 1e6 * PRICE_IN_PER_M +
             handler.completion_tokens / 1e6 * PRICE_OUT_PER_M)
     log_interaction(interaction["id"], interaction["server"],
