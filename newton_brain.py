@@ -888,7 +888,7 @@ def run_agent(interaction):
     # IPv6 entries that break its URL parsing ("Invalid port: ':1]'").
     # start_bot.sh overrides no_proxy/NO_PROXY — always launch via it.
     http_client = httpx.Client(follow_redirects=False, timeout=60)
-    llm = ChatOpenAI(model=MODEL, temperature=0.9, max_tokens=800,
+    llm = ChatOpenAI(model=MODEL, temperature=0.9, max_tokens=2000,
                      base_url=API_BASE, api_key=surrogate,
                      http_client=http_client,
                      extra_body={"reasoning": {"effort": "medium"}})
