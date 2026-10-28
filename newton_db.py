@@ -146,6 +146,22 @@ def connect(db_path=DB_PATH_DEFAULT):
         conn.executescript(NOTES_SCHEMA)
     except NameError:
         pass
+    # Proactive posts live in PROACTIVE_SCHEMA (same pattern).
+    try:
+        conn.executescript(PROACTIVE_SCHEMA)
+    except NameError:
+        pass
+    # Participation-gate telemetry lives in GATE_SCHEMA (same pattern).
+    try:
+        conn.executescript(GATE_SCHEMA)
+    except NameError:
+        pass
+    # Participation-gate migration (2026-10-28): interactions.gate records
+    # how a queued interaction passed the gate ('addressed',
+    # 'continuation', 'latched-addressed'); NULL for pre-gate rows.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(interactions)")]
+    if "gate" not in cols:
+        conn.execute("ALTER TABLE interactions ADD COLUMN gate TEXT")
     conn.commit()
     return conn
 
@@ -272,6 +288,21 @@ def score_conversation(conn, conv_id):
 
 
 def open_conversation(conn, server, channel, started_utc=None, started_qc=None):
+    # Participation-gate fix (2026-10-28): never leave two open windows
+    # for one channel. The old code opened a fresh conversation on every
+    # (re)join while the pre-restart one stayed open, so every later
+    # count query double-counted the overlap (266 conversations claiming
+    # 4,761 messages vs 956 real). Close priors first; their end abuts
+    # this start, so windows never overlap again.
+    for (oid,) in conn.execute(
+        "SELECT id FROM conversations WHERE server = ? AND channel = ?"
+        " AND ended_utc IS NULL",
+        (server, channel),
+    ).fetchall():
+        try:
+            finish_conversation(conn, oid)
+        except Exception:
+            pass
     if started_utc is None:
         started_utc, started_qc = now_pair()
     cur = conn.execute(
@@ -304,11 +335,31 @@ def refresh_conversation_counts(conn, conv_id):
 
 
 def finish_conversation(conn, conv_id):
-    """Close a conversation: set end time, counts, chaos rating + evaluation."""
+    """Close a conversation: set end time, counts, chaos rating + evaluation.
+
+    The end is capped at the next conversation's start for the same
+    channel when one exists: legacy overlapping windows (opened before
+    the 2026-10-28 open_conversation fix) are repaired at finalize time
+    instead of double-counting their overlap forever.
+    """
     ts_utc, ts_qc = now_pair()
+    end_utc, end_qc = ts_utc, ts_qc
+    row = conn.execute(
+        "SELECT server, channel, started_utc FROM conversations WHERE id = ?",
+        (conv_id,),
+    ).fetchone()
+    if row:
+        nxt = conn.execute(
+            "SELECT started_utc, started_quebec FROM conversations"
+            " WHERE server = ? AND channel = ? AND started_utc > ?"
+            " ORDER BY started_utc LIMIT 1",
+            (row[0], row[1], row[2]),
+        ).fetchone()
+        if nxt and nxt[0] < ts_utc:
+            end_utc, end_qc = nxt
     conn.execute(
         "UPDATE conversations SET ended_utc = ?, ended_quebec = ? WHERE id = ? AND ended_utc IS NULL",
-        (ts_utc, ts_qc, conv_id),
+        (end_utc, end_qc, conv_id),
     )
     conn.commit()
     refresh_conversation_counts(conn, conv_id)
@@ -319,6 +370,35 @@ def finish_conversation(conn, conv_id):
     )
     conn.commit()
     return rating, evaluation
+
+
+# ---------------------------------------------------------------------------
+# Participation-gate telemetry (2026-10-28, operator-approved).
+#
+# gate_decisions logs EVERY gate verdict, including skips that never
+# become interactions — otherwise the gate's own behaviour (how many
+# julia-addressed threads it refused, how often the latch fired) would
+# be invisible. interactions.gate records how a QUEUED row passed the
+# gate, so the daily report can tell addressed replies apart from
+# continuations without trusting the brain's self-scores.
+# ---------------------------------------------------------------------------
+
+GATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS gate_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    msg_id INTEGER,
+    sender TEXT,
+    text TEXT,
+    decision TEXT NOT NULL,
+    reason TEXT,
+    ts_utc TEXT NOT NULL,
+    ts_quebec TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gate_decisions_channel
+    ON gate_decisions (server, channel, ts_utc);
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -367,12 +447,14 @@ def get_recent_outbound(conn, server, channel, n=20):
 
 
 def queue_or_merge_interaction(conn, server, channel, trigger_msg_id,
-                               trigger_sender, trigger_text):
+                               trigger_sender, trigger_text, gate=None):
     """Create a pending interaction, or merge into the existing pending
     one for this channel (one entry per channel, not per message burst).
 
     Merging refreshes the trigger to the latest message and rebuilds the
     context, so the brain always reasons over the freshest thread state.
+    The gate verdict travels with the row (refreshed on merge) so the
+    report can tell addressed replies from continuations.
     Returns the interaction id.
     """
     import json as _json
@@ -387,18 +469,18 @@ def queue_or_merge_interaction(conn, server, channel, trigger_msg_id,
     if existing:
         conn.execute(
             "UPDATE interactions SET trigger_msg_id = ?, trigger_sender = ?,"
-            " trigger_text = ?, context_json = ? WHERE id = ?",
-            (trigger_msg_id, trigger_sender, trigger_text, context,
+            " trigger_text = ?, context_json = ?, gate = ? WHERE id = ?",
+            (trigger_msg_id, trigger_sender, trigger_text, context, gate,
              existing[0]),
         )
         conn.commit()
         return existing[0]
     cur = conn.execute(
         "INSERT INTO interactions (server, channel, trigger_msg_id,"
-        " trigger_sender, trigger_text, context_json, status, created_utc)"
-        " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+        " trigger_sender, trigger_text, context_json, status, created_utc, gate)"
+        " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
         (server, channel, trigger_msg_id, trigger_sender, trigger_text,
-         context, ts_utc),
+         context, ts_utc, gate),
     )
     conn.commit()
     return cur.lastrowid
@@ -408,14 +490,14 @@ def get_pending_interactions(conn):
     """All pending interactions, oldest first, as dicts."""
     rows = conn.execute(
         "SELECT id, server, channel, trigger_msg_id, trigger_sender,"
-        " trigger_text, context_json, created_utc FROM interactions"
+        " trigger_text, context_json, created_utc, gate FROM interactions"
         " WHERE status = 'pending' ORDER BY id",
     ).fetchall()
     return [
         {"id": r[0], "server": r[1], "channel": r[2],
          "trigger_msg_id": r[3], "trigger_sender": r[4],
          "trigger_text": r[5], "context_json": r[6],
-         "created_utc": r[7]}
+         "created_utc": r[7], "gate": r[8]}
         for r in rows
     ]
 
@@ -429,6 +511,122 @@ def mark_interaction(conn, iid, status, reply_text=None, skip_reason=None):
         (status, reply_text, skip_reason, ts_utc, iid),
     )
     conn.commit()
+
+
+def log_gate_decision(conn, server, channel, msg_id, sender, text,
+                      decision, reason):
+    """One telemetry row per gate verdict (queued AND skipped).
+
+    Decisions: 'queued' (with reason = gate verdict: 'addressed',
+    'continuation', 'latched-addressed'), 'skipped' (reason =
+    'other-addressee', 'topical-only', 'latched'), 'latched'
+    (a complaint set the latch; the message itself never queued).
+    """
+    ts_utc, ts_qc = now_pair()
+    conn.execute(
+        "INSERT INTO gate_decisions (server, channel, msg_id, sender, text,"
+        " decision, reason, ts_utc, ts_quebec) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (server, channel, msg_id, sender, text, decision, reason,
+         ts_utc, ts_qc),
+    )
+    conn.commit()
+
+
+def close_pending_for_channel(conn, server, channel, reason):
+    """Mark every pending interaction for a channel skipped.
+
+    Used when a complaint latches the channel: answering an already
+    queued trigger into a complaint is exactly the backscroll spray
+    that got #robots kicked. Returns (id, trigger_msg_id,
+    trigger_sender) rows for the closed interactions.
+    """
+    rows = conn.execute(
+        "SELECT id, trigger_msg_id, trigger_sender FROM interactions"
+        " WHERE server = ? AND channel = ? AND status = 'pending'",
+        (server, channel),
+    ).fetchall()
+    ts_utc, _ = now_pair()
+    for (iid, _tmid, _ts) in rows:
+        conn.execute(
+            "UPDATE interactions SET status = 'skipped', skip_reason = ?,"
+            " decided_utc = ? WHERE id = ?",
+            (reason, ts_utc, iid),
+        )
+    conn.commit()
+    return rows
+
+
+def get_message_ts(conn, msg_id):
+    """UTC timestamp of a message row, or None when unknown."""
+    row = conn.execute(
+        "SELECT ts_utc FROM messages WHERE id = ?", (msg_id,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def gate_metrics(conn, since):
+    """Participation-gate metrics for a window (since = UTC ISO).
+
+    Deliberately separate from the brain's self-scores: every number
+    here comes from logged rows (messages, interactions, gate
+    decisions), not from the model's opinion of its own replies.
+    """
+    answered_total = conn.execute(
+        "SELECT COUNT(*) FROM interactions WHERE status = 'answered'"
+        " AND decided_utc >= ?",
+        (since,),
+    ).fetchone()[0]
+    addressed = conn.execute(
+        "SELECT COUNT(*) FROM interactions WHERE status = 'answered'"
+        " AND gate IN ('addressed', 'latched-addressed')"
+        " AND decided_utc >= ?",
+        (since,),
+    ).fetchone()[0]
+    peer_followups = conn.execute(
+        "SELECT COUNT(DISTINCT o.id) FROM messages o"
+        " WHERE o.direction = 'outbound' AND o.ts_utc >= ?"
+        " AND EXISTS (SELECT 1 FROM messages i WHERE i.server = o.server"
+        " AND i.channel = o.channel AND i.direction = 'inbound'"
+        # datetime() on BOTH sides: raw ts_utc is ISO with a 'T' and a
+        # +00:00 suffix, while datetime() returns space-separated
+        # UTC — comparing the raw strings directly breaks (the 'T'
+        # sorts after the space, so every follow-up looked too late).
+        " AND datetime(i.ts_utc) > datetime(o.ts_utc)"
+        " AND datetime(i.ts_utc) <= datetime(o.ts_utc, '+15 minutes'))",
+        (since,),
+    ).fetchone()[0]
+    latched = conn.execute(
+        "SELECT COUNT(*) FROM gate_decisions WHERE decision = 'latched'"
+        " AND ts_utc >= ?",
+        (since,),
+    ).fetchone()[0]
+    warning_skips = conn.execute(
+        "SELECT COUNT(*) FROM interactions WHERE status = 'skipped'"
+        " AND skip_reason LIKE '%warning%' AND decided_utc >= ?",
+        (since,),
+    ).fetchone()[0]
+    unanswered_direct = conn.execute(
+        "SELECT COUNT(*) FROM interactions WHERE status = 'skipped'"
+        " AND gate IN ('addressed', 'latched-addressed')"
+        " AND decided_utc >= ?",
+        (since,),
+    ).fetchone()[0]
+    breakdown = dict(conn.execute(
+        "SELECT decision, COUNT(*) FROM gate_decisions"
+        " WHERE ts_utc >= ? GROUP BY decision",
+        (since,),
+    ).fetchall())
+    return {
+        "answered_total": answered_total,
+        "addressed": addressed,
+        "addressed_pct": (100.0 * addressed / answered_total
+                          if answered_total else None),
+        "peer_followups": peer_followups,
+        "latched": latched,
+        "warning_skips": warning_skips,
+        "unanswered_direct": unanswered_direct,
+        "gate_breakdown": breakdown,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -583,3 +781,168 @@ def get_trend(conn):
     live["kicks"] = tk
     live["bans"] = tb
     return {"overall": overall, "live": live, "days": days}
+
+
+# ---------------------------------------------------------------------------
+# Proactive posts: scheduled openers for quiet channels (2026-10-26).
+#
+# The operator ordered Newton to PROVOKE interactions from time to
+# time on quiet channels (questions, thoughts, ideas) — reactive-only
+# was leaving dead rooms dead. This table scores every proactive
+# opener the way interactions are scored: did it draw replies?
+#   status: 'pending' until the outcome window closes, then
+#     'replied' (>=1 inbound message mentioning Newton),
+#     'activity' (>=1 inbound, none mentioning him),
+#     'silent' (no inbound at all in the window),
+#     'complaint' (a warning/complaint about Newton followed it).
+# The lessons synthesis reads this table, so the brain learns which
+# kinds of openers work per channel — and which channels to leave
+# alone proactively. A proactive post is also logged as a normal
+# outbound message (by the send path), so this table is the scoring
+# overlay, not the delivery record.
+# ---------------------------------------------------------------------------
+
+PROACTIVE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS proactive_posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    server TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    opener_text TEXT NOT NULL,
+    sent_utc TEXT NOT NULL,
+    sent_quebec TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'replied', 'activity', 'silent',
+                          'complaint')),
+    replies_count INTEGER NOT NULL DEFAULT 0,
+    directed_replies INTEGER NOT NULL DEFAULT 0,
+    last_reply_utc TEXT,
+    finalized_utc TEXT,
+    note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_proactive_server_channel
+    ON proactive_posts (server, channel, sent_utc);
+"""
+
+
+def record_proactive_post(conn, server, channel, opener_text):
+    """Record a proactive opener that was actually SENT (called by the
+    outbox loop on successful delivery, never at queue time). Returns
+    the row id. Status starts 'pending' until the outcome window
+    closes."""
+    ts_utc, ts_qc = now_pair()
+    cur = conn.execute(
+        "INSERT INTO proactive_posts (server, channel, opener_text,"
+        " sent_utc, sent_quebec) VALUES (?, ?, ?, ?, ?)",
+        (server, channel, opener_text, ts_utc, ts_qc),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_pending_proactive(conn):
+    """All proactive posts still awaiting an outcome, oldest first."""
+    rows = conn.execute(
+        "SELECT id, server, channel, opener_text, sent_utc, sent_quebec"
+        " FROM proactive_posts WHERE status = 'pending' ORDER BY id",
+    ).fetchall()
+    return [
+        {"id": r[0], "server": r[1], "channel": r[2],
+         "opener_text": r[3], "sent_utc": r[4], "sent_quebec": r[5]}
+        for r in rows
+    ]
+
+
+def finalize_proactive(conn, post_id, status, replies_count,
+                       directed_replies, last_reply_utc, note):
+    """Close a proactive post with its measured outcome."""
+    ts_utc, _ = now_pair()
+    conn.execute(
+        "UPDATE proactive_posts SET status = ?, replies_count = ?,"
+        " directed_replies = ?, last_reply_utc = ?, finalized_utc = ?,"
+        " note = ? WHERE id = ?",
+        (status, replies_count, directed_replies, last_reply_utc,
+         ts_utc, note, post_id),
+    )
+    conn.commit()
+
+
+def get_recent_proactive_openers(conn, n=10, server=None, channel=None):
+    """Recent proactive opener texts, newest first. Filter to one
+    channel, or pass neither filter for the cross-channel list (the
+    freshness check must catch cross-channel duplicates too)."""
+    q = ("SELECT opener_text FROM proactive_posts")
+    params = []
+    if server is not None and channel is not None:
+        q += " WHERE server = ? AND channel = ?"
+        params = [server, channel]
+    q += " ORDER BY id DESC LIMIT ?"
+    params.append(n)
+    return [r[0] for r in conn.execute(q, params).fetchall()]
+
+
+def get_channel_activity(conn, server, channel):
+    """Durable quiet-channel signals for one channel.
+
+    Returns dict: last_inbound_utc (None if no inbound ever),
+    inbound_total, last_outbound_utc (None if Newton never spoke).
+    The bot's in-memory ChannelState resets on restart; this does not.
+    """
+    row = conn.execute(
+        "SELECT MAX(CASE WHEN direction = 'inbound' THEN ts_utc END),"
+        " COUNT(CASE WHEN direction = 'inbound' THEN 1 END),"
+        " MAX(CASE WHEN direction = 'outbound' THEN ts_utc END)"
+        " FROM messages WHERE server = ? AND channel = ?",
+        (server, channel),
+    ).fetchone()
+    return {"last_inbound_utc": row[0], "inbound_total": row[1] or 0,
+            "last_outbound_utc": row[2]}
+
+
+def get_channel_hour_profile(conn, server, channel):
+    """Inbound messages per Quebec hour (0-23) for one channel.
+
+    The proactive scheduler prefers each channel's historically active
+    hours; with no history it falls back to daytime/evening hours.
+    Returns {hour_int: count}."""
+    rows = conn.execute(
+        "SELECT CAST(substr(ts_quebec, 12, 2) AS INTEGER), COUNT(*)"
+        " FROM messages WHERE server = ? AND channel = ?"
+        " AND direction = 'inbound' GROUP BY 1",
+        (server, channel),
+    ).fetchall()
+    return {int(h): c for h, c in rows}
+
+
+def get_consecutive_silent_proactive(conn, server, channel):
+    """Trailing run of finalized 'silent' proactive posts in a
+    channel (0 if the latest finalized post drew any response).
+    Two in a row means: leave this channel alone proactively."""
+    rows = conn.execute(
+        "SELECT status FROM proactive_posts WHERE server = ?"
+        " AND channel = ? AND status != 'pending' ORDER BY id DESC",
+        (server, channel),
+    ).fetchall()
+    streak = 0
+    for (status,) in rows:
+        if status == "silent":
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def get_proactive_since(conn, after_id):
+    """Finalized proactive posts with id > after_id, oldest first
+    (for the lessons synthesis watermark)."""
+    rows = conn.execute(
+        "SELECT id, server, channel, status, replies_count,"
+        " directed_replies, opener_text FROM proactive_posts"
+        " WHERE id > ? AND status != 'pending' ORDER BY id",
+        (after_id,),
+    ).fetchall()
+    return [
+        {"id": r[0], "server": r[1], "channel": r[2], "status": r[3],
+         "replies_count": r[4], "directed_replies": r[5],
+         "opener_text": r[6]}
+        for r in rows
+    ]

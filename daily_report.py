@@ -80,6 +80,27 @@ def build_report(conn):
         (since,)).fetchall():
         lines.append(f"  {server} {channel} {d}: {n}")
     lines.append("")
+    lines.append("PARTICIPATION GATE (last 24h, from logged rows — not self-scores):")
+    try:
+        gm = newton_db.gate_metrics(conn, since)
+        pct = (f"{gm['addressed_pct']:.0f}%" if gm["addressed_pct"] is not None
+               else "n/a (no answered interactions)")
+        lines.append(f"  Answered interactions: {gm['answered_total']},"
+                     f" of which directly addressed: {gm['addressed']} ({pct})")
+        lines.append(f"  Newton replies that drew a peer follow-up within 15 min:"
+                     f" {gm['peer_followups']}")
+        lines.append(f"  Complaint latches set: {gm['latched']},"
+                     f" warning skips: {gm['warning_skips']}")
+        lines.append(f"  Direct questions left unanswered: {gm['unanswered_direct']}")
+        bd = gm["gate_breakdown"]
+        if bd:
+            lines.append("  Gate verdicts: " + ", ".join(
+                f"{k}={v}" for k, v in sorted(bd.items())))
+        else:
+            lines.append("  Gate verdicts: (none logged — gate not yet deployed)")
+    except Exception as e:
+        lines.append(f"  (gate metrics unavailable: {e})")
+    lines.append("")
     lines.append("Conversations finished (last 24h, with chaos rating 0-1000):")
     rows = conn.execute(
         "SELECT server, channel, started_quebec, ended_quebec, message_count,"

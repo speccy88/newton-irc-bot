@@ -172,35 +172,13 @@ FLIP_LIMIT = 2  # flips inside FLIP_WINDOW -> suspend reclaiming
 KEEPALIVE_IDLE_S = 150.0
 KEEPALIVE_POLL_S = 60.0
 
-# Topic keywords for QUEUE TRIGGERS ONLY. These words decide whether an
-# inbound message is worth the brain's attention; they never select a
-# reply (there are no replies in this file anymore).
-TOPIC_KEYWORDS = {
-    "fpga": ["verilog", "vhdl", "fpga", "timing closure", "synthesis",
-             "xilinx", "altera"],
-    "mcu": ["esp32", "arduino", "raspberry pi", "pico", "stm32",
-            "microcontroller", "mcu", "avr", "atmel"],
-    "isa": ["risc-v", "riscv", "arm", "x86", "cpu", "isa",
-            "instruction set", "apple silicon"],
-    "lang": ["rust", "c++", "python", "javascript", "golang",
-             "haskell", "programming language"],
-    "linux": ["linux", "kernel", "distro", "ubuntu", "debian", "arch",
-              "gentoo", "nixos"],
-    "ai": ["llm", "chatgpt", "copilot", "machine learning", "neural",
-           "local ai", "openai", "anthropic", "token"],
-    "micro": ["microservice", "kubernetes", "docker", "monolith",
-              "serverless"],
-    "money": ["billionaire", "elon", "trump", "social network"],
-}
-_ALL_KEYWORDS = [k for kws in TOPIC_KEYWORDS.values() for k in kws]
-
-# Problem-statement trigger (infiltration doctrine 2026-10-26): a
-# message describing something broken counts as a thread worth the
-# brain's attention even without a question mark — the #vtluug
-# acidburn/sssd thread ("won't give me a shell", "auth must be
-# busted") never queued under the old question-only rule. The brain
-# still decides reply vs skip; queueing is not replying.
-PROBLEM_RE = re.compile(r"\b(won't|can't|cannot|busted|broken|fails?|failing|failure|errors?|stuck|crash(?:es)?|bricked)\b")
+# NOTE (2026-10-28, participation gate): the old topical queue
+# triggers (TOPIC_KEYWORDS / PROBLEM_RE) were deleted with the gate.
+# Topical similarity alone never queues anymore — only an explicit
+# address to Newton or a clear continuation of his exchange does.
+# Do not re-add keyword triggers: they were the julia-thread pattern
+# (28/47 answered interactions on julia-addressed messages) and the
+# #robots kick.
 
 
 def is_own_nick(sender):
@@ -254,6 +232,184 @@ def save_kicked(kicked):
     os.replace(tmp, KICKED_FILE)
 
 
+# Participation gate (2026-10-28, operator-approved): ban suppression
+# and the complaint latch use the same persistent-file pattern as
+# kicked.json — atomic tmp+rename, re-read every tick, operator-cleared
+# by deleting the entry. No restart needed to clear either.
+BANNED_FILE = os.path.join(BASE, "banned.json")
+LATCHED_FILE = os.path.join(BASE, "latched.json")
+
+
+def load_banned():
+    """Persistent confirmed bans: {server: [channels]}.
+
+    A JOIN_FAIL_474 (+b ban) is a confirmed ban, not a transient
+    failure — but the old code only logged it, so every restart
+    rejoined the banned channel and sprayed another 474 (the #vtluug
+    pattern: 8+ retries, all restart-aligned). Banned channels are
+    skipped at join time exactly like kicked ones, until the operator
+    deletes the entry to clear it.
+    """
+    try:
+        with open(BANNED_FILE) as f:
+            data = json.load(f)
+        return {k: set(v) for k, v in data.items()}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_banned(banned):
+    tmp = BANNED_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({k: sorted(v) for k, v in banned.items()}, f, indent=2)
+    os.replace(tmp, BANNED_FILE)
+
+
+def load_latched():
+    """Complaint latch: {server: {channel: {reason, msg_id, ts_utc}}}.
+
+    When someone asks Newton not to interrupt, the channel latches:
+    unsolicited replies stop there until the OPERATOR clears it (delete
+    the entry). Direct addresses still queue while latched — the latch
+    stops interruptions, not conversations someone starts with Newton.
+    """
+    try:
+        with open(LATCHED_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_latched(latched):
+    tmp = LATCHED_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(latched, f, indent=2)
+    os.replace(tmp, LATCHED_FILE)
+
+
+def set_latch(server, channel, reason, msg_id):
+    latched = load_latched()
+    latched.setdefault(server, {})[channel] = {
+        "reason": reason, "msg_id": msg_id, "ts_utc": time.time(),
+    }
+    save_latched(latched)
+
+
+# ---------------------------------------------------------------------------
+# Participation gate (2026-10-28, operator-approved): structural, BEFORE
+# any LLM call. A message queues ONLY when explicitly addressed to
+# Newton or clearly continuing an established Newton exchange. Topical
+# similarity alone never queues — that was the julia-thread pattern
+# (28/47 answered interactions triggered by julia-addressed messages)
+# and the #robots kick. Pure functions below, so the gate is unit
+# testable without a connection.
+# ---------------------------------------------------------------------------
+
+GATE_STALE_TRIGGER_S = 30 * 60  # brain-loop: a trigger older than
+# this at decision time is backscroll, not a live thread — skip it.
+# This is the direct fix for the #robots kick: after a restart, queued
+# triggers piled up and the bot answered them all at once into the
+# backscroll. Fresh threads only.
+
+GATE_IMMEDIATE_REPLY_S = 300  # a reply counts as an immediate
+# continuation only while Newton's line is the last message in the
+# channel AND fresh (5 min). Longer than that, a bystander's topical
+# take is not a continuation just because Newton spoke recently.
+
+_NICK_TOKEN = r"[A-Za-z0-9_\-\[\]\\`^{}|]+"
+
+
+def _strip_action(text):
+    """Strip a /me ACTION wrapper (\\x01ACTION ... \\x01) for matching."""
+    if text.startswith("\x01ACTION ") and text.endswith("\x01"):
+        return text[9:-1]
+    return text
+
+
+def _leading_addressee(text, known_nicks):
+    """Nick addressed at the start ("julia, ...", "newton: ..."), or None.
+
+    Only a KNOWN nick counts: a leading common word ("well, ...",
+    "note: ...") is not an addressee. Every participant who ever spoke
+    is known (active_members), so a real addressee is never missed.
+    """
+    m = re.match(r"^\s*(" + _NICK_TOKEN + r")\s*[:,]\s+", text)
+    if m and m.group(1).lower() in known_nicks:
+        return m.group(1)
+    return None
+
+
+def _is_direct_address(text, own_nicks, known_nicks):
+    """Explicitly addressed to Newton: leading nick, or trailing vocative."""
+    t = _strip_action(text).strip()
+    own = {n.lower() for n in own_nicks}
+    addr = _leading_addressee(t, known_nicks)
+    if addr is not None:
+        return addr.lower() in own
+    for n in own_nicks:
+        if re.search(r",\s*" + re.escape(n) + r"\b", t, re.IGNORECASE):
+            return True
+        if re.search(r"\b" + re.escape(n) + r"[?!.]*\s*$", t, re.IGNORECASE):
+            return True
+    return False
+
+
+def _is_addressed_to_other(text, own_nicks, known_nicks):
+    """Leading addressee is someone else (the julia-thread pattern)."""
+    t = _strip_action(text).strip()
+    addr = _leading_addressee(t, known_nicks)
+    return addr is not None and \
+        addr.lower() not in {n.lower() for n in own_nicks}
+
+
+def _is_continuation(st, sender):
+    """Clearly continuing an established Newton exchange: Newton spoke
+    in the last 15 min AND the sender already spoke in this exchange,
+    or the sender answers a question Newton asked, or the sender is
+    the immediate reply to Newton's last line (fresh, 5 min). A
+    bystander's topical take in a live window is none of these."""
+    if st.last_newton_msg <= 0:
+        return False
+    since_newton = time.time() - st.last_newton_msg
+    if since_newton > THREAD_WINDOW_S:
+        return False
+    if sender in st.speakers_since_newton:
+        return True
+    if st.last_newton_text.strip().endswith("?"):
+        return True
+    return st.last_msg_from_newton and since_newton <= GATE_IMMEDIATE_REPLY_S
+
+
+LATCH_PATTERNS = [
+    re.compile(r"\bautorespond\w*\b", re.IGNORECASE),
+    re.compile(r"\bauto[- ]?repl\w*\b", re.IGNORECASE),
+    re.compile(r"\bstop\b.{0,25}\b(respond\w*|reply\w*|posting|spam\w*|flooding)\b",
+               re.IGNORECASE),
+    re.compile(r"\bquit\b.{0,25}\b(respond\w*|reply\w*|posting)\b",
+               re.IGNORECASE),
+    re.compile(r"\bno more\b.{0,20}\b(bot|auto)\b", re.IGNORECASE),
+    re.compile(r"\bdon't\b.{0,25}\b(respond\w*|reply\w*|autorespond\w*)\b",
+               re.IGNORECASE),
+]
+
+
+def _is_complaint_about_newton(text, own_nicks, thread_active):
+    """A complaint ABOUT Newton (not about someone else).
+
+    Requires a complaint pattern AND a Newton link: Newton mentioned
+    by name, or a live Newton thread (he spoke in the last 15 min).
+    A bare "shut up" about another user must never latch the channel.
+    """
+    t = _strip_action(text)
+    linked = thread_active or any(
+        re.search(r"\b" + re.escape(n) + r"\b", t, re.IGNORECASE)
+        for n in own_nicks)
+    if not linked:
+        return False
+    return (any(p.search(t) for p in LATCH_PATTERNS)
+            or any(p.search(t) for p in WARNING_PATTERNS))
+
+
 _REGISTRY = {}
 
 
@@ -278,10 +434,18 @@ class ChannelState:
         self.last_newton_msg = 0.0
         self.last_inbound = 0.0
         self.active_members = set()
+        # Participation gate: who has spoken since Newton's last line,
+        # and what that line was. A continuer is someone already in
+        # this exchange (speaks after Newton spoke), someone answering
+        # a question Newton asked, or someone replying immediately to
+        # Newton's last line. Reset on every Newton outbound.
+        self.speakers_since_newton = set()
+        self.last_newton_text = ""
+        self.last_msg_from_newton = False
 
 
 class NetworkBot:
-    def __init__(self, netname, cfg, db_conn, kicked):
+    def __init__(self, netname, cfg, db_conn, kicked, banned=None):
         self.netname = netname
         self.cfg = cfg
         self.db = db_conn
@@ -291,6 +455,7 @@ class NetworkBot:
         self.global_last = 0.0
         self.joined = set()
         self.kicked = set(kicked.get(netname, set()))
+        self.banned = set((banned or {}).get(netname, set()))
         self.reclaim_pending = False
         # Nick stability state (see JOIN_SETTLE_S / RECLAIM_* constants).
         self.reclaim_delay = RECLAIM_BASE_S
@@ -439,6 +604,9 @@ class NetworkBot:
         self.send(f"PRIVMSG {channel} :{text}")
         newton_db.log_message(self.db, self.netname, channel, self.nick, "outbound", text)
         st.last_newton_msg = time.time()
+        st.speakers_since_newton = set()
+        st.last_newton_text = text
+        st.last_msg_from_newton = True
         self.global_last = time.time()
         self._touch(channel)
         return True
@@ -478,38 +646,119 @@ class NetworkBot:
         st.last_inbound = time.time()
         self._touch(channel)
         self._maybe_queue(channel, sender, text, msg_id)
+        # Recorded AFTER the gate decision: the current message must
+        # not make its own sender count as "already in the exchange",
+        # and must clear the immediate-reply flag for the next one.
+        st.speakers_since_newton.add(sender)
+        st.last_msg_from_newton = False
 
     def _maybe_queue(self, channel, sender, text, msg_id):
-        """Interaction queue triggers (brain decides, bot only flags).
+        """Participation gate (2026-10-28, operator-approved).
 
-        Queue when: (a) Newton is mentioned; (b) Newton spoke in this
-        channel in the last 15 min AND the message is a question or a
-        topical message (thread continuation); (c) a topical question in
-        a channel Newton is in; (d) a problem statement (PROBLEM_RE) —
-        a live troubleshooting thread is exactly where a peer earns
-        his place; (e) any topical message at all (topic keyword,
-        even a bare statement or take) — a live topical thread is an
-        invitation; the brain decides whether the reply earns its
-        place. Bursts merge into the one pending row for the
-        channel — the brain always sees the freshest thread.
-        Everything else: listen + log, stay silent.
+        Structural, BEFORE any LLM call. A message queues ONLY when:
+          (a) it is explicitly addressed to Newton (leading nick, or
+              trailing vocative: "Newton, ...", "..., Newton"), or
+          (b) it clearly continues an established Newton exchange
+              (Newton spoke in the last 15 min AND the sender already
+              spoke in this exchange, answers a question Newton asked,
+              or is the immediate reply to Newton's last line).
+        Topical similarity alone NEVER queues — that was the
+        julia-thread pattern and the #robots kick. A complaint about
+        Newton latches the channel instead of queueing: unsolicited
+        replies stop until the operator clears the latch (delete the
+        entry from latched.json); direct addresses still queue while
+        latched. Every verdict is logged to gate_decisions for the
+        report's separate metrics. This is NOT an operator allowlist:
+        anyone may address Newton and be answered; the gate is about
+        addressing, not permission.
         """
-        if channel in self.kicked:
+        if channel in self.kicked or channel in self.banned:
             return
         st = self.channels[channel]
-        low = text.lower()
-        mentioned = NICK.lower() in low or self.nick.lower() in low
-        topic_hit = any(k in low for k in _ALL_KEYWORDS)
-        is_q = "?" in text
+        own = {NICK, self.nick}
+        known = {m.lower() for m in st.active_members} | \
+            {n.lower() for n in own}
+        clean = _strip_action(text)
         thread_active = st.last_newton_msg > 0 and \
             (time.time() - st.last_newton_msg) <= THREAD_WINDOW_S
-        problem_hit = PROBLEM_RE.search(low) is not None
-        if mentioned or (topic_hit and (is_q or thread_active)) or \
-                (thread_active and is_q) or problem_hit or topic_hit:
-            iid = newton_db.queue_or_merge_interaction(
-                self.db, self.netname, channel, msg_id, sender, text)
-            print(f"[{self.netname} {channel}] queued interaction {iid} "
+        # 1. Complaint about Newton -> latch, close pending, never queue.
+        if _is_complaint_about_newton(clean, own, thread_active):
+            set_latch(self.netname, channel, clean[:120], msg_id)
+            closed = newton_db.close_pending_for_channel(
+                self.db, self.netname, channel, "complaint latch")
+            for iid, tmid, tsender in closed:
+                newton_db.write_interaction_note(
+                    self.db, self.netname, channel, "skipped",
+                    "Skipped: a complaint latched this channel, so the "
+                    "queued trigger was closed instead of answered into "
+                    "the complaint.",
+                    interaction_id=iid, trigger_msg_id=tmid,
+                    trigger_sender=tsender,
+                    engagement=0, detection_risk=0, reply_quality=None,
+                    heat=0, repeated=0, source="brain")
+            newton_db.log_gate_decision(
+                self.db, self.netname, channel, msg_id, sender, text,
+                "latched", "complaint about Newton")
+            print(f"[{self.netname} {channel}] complaint latch set "
                   f"(trigger: {sender}: {text[:60]})", flush=True)
+            return
+        # 2. Latched channel: only direct addresses queue.
+        latched = channel in load_latched().get(self.netname, {})
+        if _is_direct_address(clean, own, known):
+            gate = "latched-addressed" if latched else "addressed"
+            iid = newton_db.queue_or_merge_interaction(
+                self.db, self.netname, channel, msg_id, sender, text,
+                gate=gate)
+            newton_db.log_gate_decision(
+                self.db, self.netname, channel, msg_id, sender, text,
+                "queued", gate)
+            print(f"[{self.netname} {channel}] queued interaction {iid} "
+                  f"(gate={gate}, trigger: {sender}: {text[:60]})", flush=True)
+            return
+        if _is_addressed_to_other(clean, own, known):
+            newton_db.log_gate_decision(
+                self.db, self.netname, channel, msg_id, sender, text,
+                "skipped", "other-addressee")
+            return
+        if latched:
+            newton_db.log_gate_decision(
+                self.db, self.netname, channel, msg_id, sender, text,
+                "skipped", "latched")
+            return
+        if _is_continuation(st, sender):
+            iid = newton_db.queue_or_merge_interaction(
+                self.db, self.netname, channel, msg_id, sender, text,
+                gate="continuation")
+            newton_db.log_gate_decision(
+                self.db, self.netname, channel, msg_id, sender, text,
+                "queued", "continuation")
+            print(f"[{self.netname} {channel}] queued interaction {iid} "
+                  f"(gate=continuation, trigger: {sender}: {text[:60]})",
+                  flush=True)
+            return
+        newton_db.log_gate_decision(
+            self.db, self.netname, channel, msg_id, sender, text,
+            "skipped", "topical-only")
+
+    def _on_join_fail(self, cmd, ch, trailing):
+        """JOIN failure: log the event, and persist a 474 as a ban.
+
+        Other 47x codes (full, invite-only, bad key) stay log-only:
+        they can clear on their own. A 474 (+b) does not clear on its
+        own, so it joins banned.json — the join loop skips banned
+        channels, which ends the restart-aligned 474 spray. The
+        operator clears a ban by deleting the entry from banned.json.
+        """
+        newton_db.log_event(self.db, self.netname, ch, f"JOIN_FAIL_{cmd}",
+                            self.nick, trailing)
+        print(f"[{self.netname}] cannot join {ch}: {cmd} {trailing}", flush=True)
+        if cmd == "474" and ch not in self.banned:
+            self.banned.add(ch)
+            banned_all = load_banned()
+            banned_all.setdefault(self.netname, set()).add(ch)
+            save_banned(banned_all)
+            print(f"[{self.netname}] {ch} recorded as banned (474) — "
+                  "will not retry until the operator clears it.", flush=True)
 
     async def run_forever(self):
         # Reconnect backoff: start 30s, double to a 900s cap, with jitter.
@@ -594,6 +843,8 @@ class NetworkBot:
                     for ch in cfg["channels"]:
                         if ch in self.kicked:
                             continue
+                        if ch in self.banned:
+                            continue
                         try:
                             if writer.is_closing():
                                 break
@@ -631,9 +882,7 @@ class NetworkBot:
                     continue
                 if cmd in ("471", "473", "474", "475", "476", "477", "479") and len(params) > 1:
                     ch = params[1]
-                    newton_db.log_event(self.db, self.netname, ch, f"JOIN_FAIL_{cmd}",
-                                        self.nick, trailing)
-                    print(f"[{self.netname}] cannot join {ch}: {cmd} {trailing}", flush=True)
+                    self._on_join_fail(cmd, ch, trailing)
                     continue
                 if cmd == "KICK" and len(params) > 1:
                     ch, victim = params[0], params[1]
@@ -756,12 +1005,19 @@ WARNING_PATTERNS = [
     re.compile(r"bots? (are )?not allowed", re.IGNORECASE),
     re.compile(r"bot infestation", re.IGNORECASE),
     re.compile(r"\bno bots?\b", re.IGNORECASE),
-    re.compile(r"\bstop\b.{0,25}\b(spam\w*|flooding|posting|it)\b",
+    # 2026-10-28 gate fix: the old "stop ... it" / "quit ... it"
+    # alternatives false-positived on ordinary pronouns ("just to stop
+    # being human it seems to be a signal" cooled #robots for 2h).
+    # "stop it" / "quit it" only count as stop requests at end of
+    # message now; mid-sentence pronouns no longer trip the guard.
+    re.compile(r"\bstop\b.{0,25}\b(spam\w*|flooding|posting)\b",
                re.IGNORECASE),
+    re.compile(r"\bstop it\b[.!?]*$", re.IGNORECASE),
     re.compile(r"\bshut up\b", re.IGNORECASE),
     re.compile(r"\bgo away\b", re.IGNORECASE),
     re.compile(r"\bleave (this )?channel\b", re.IGNORECASE),
-    re.compile(r"\bquit\b.{0,25}\b(spam\w*|posting|it)\b", re.IGNORECASE),
+    re.compile(r"\bquit\b.{0,25}\b(spam\w*|posting)\b", re.IGNORECASE),
+    re.compile(r"\bquit it\b[.!?]*$", re.IGNORECASE),
     re.compile(r"\bget out\b", re.IGNORECASE),
     # Ban/kick-a-bot language (2026-10-26: "How do we ban this bot
     # lol" matched nothing and drew no cooldown). These three are
@@ -1191,6 +1447,49 @@ async def brain_loop(db, bot_by_net):
                     heat=0, repeated=0, source="brain")
                 _regen_progress()
                 continue
+            if channel in bot.banned:
+                newton_db.mark_interaction(db, iid, "skipped",
+                                           skip_reason="channel banned, bot not present")
+                newton_db.write_interaction_note(
+                    db, server, channel, "skipped",
+                    "Skipped: the bot is banned from this channel, so no "
+                    "reply could be delivered. The queue entry is closed "
+                    "rather than left pending forever.",
+                    interaction_id=iid, trigger_msg_id=inter["trigger_msg_id"],
+                    trigger_sender=inter["trigger_sender"],
+                    engagement=0, detection_risk=0, reply_quality=None,
+                    heat=0, repeated=0, source="brain")
+                _regen_progress()
+                continue
+            # Participation gate, brain side: a trigger older than
+            # GATE_STALE_TRIGGER_S is backscroll, not a live thread.
+            # Queued rows pile up across restarts; answering them all
+            # at once is the spray that got #robots kicked. The gate
+            # already refuses topical-only queueing, but a stale
+            # ADDRESSED trigger must not be answered hours later
+            # either — the human has moved on.
+            _tts = newton_db.get_message_ts(db, inter["trigger_msg_id"])
+            if _tts:
+                try:
+                    _age = (datetime.now(timezone.utc)
+                            - datetime.fromisoformat(_tts)).total_seconds()
+                except ValueError:
+                    _age = 0
+                if _age > GATE_STALE_TRIGGER_S:
+                    newton_db.mark_interaction(db, iid, "skipped",
+                                               skip_reason="stale trigger (backscroll)")
+                    newton_db.write_interaction_note(
+                        db, server, channel, "skipped",
+                        "Skipped: the trigger is older than 30 minutes, "
+                        "so answering it now would be a backscroll reply "
+                        "into a moved-on thread, not a live exchange.",
+                        interaction_id=iid,
+                        trigger_msg_id=inter["trigger_msg_id"],
+                        trigger_sender=inter["trigger_sender"],
+                        engagement=0, detection_risk=0, reply_quality=None,
+                        heat=0, repeated=0, source="brain")
+                    _regen_progress()
+                    continue
             if channel not in bot.channels:
                 if not bot.channels:
                     # Connection not settled yet (channels populate at
@@ -1492,9 +1791,10 @@ async def amain():
         config = json.load(f)
     db = newton_db.connect(DB_PATH)
     kicked = load_kicked()
+    banned = load_banned()
     bots = []
     for netname, cfg in config["servers"].items():
-        bots.append(NetworkBot(netname, cfg, db, kicked))
+        bots.append(NetworkBot(netname, cfg, db, kicked, banned))
     # Single-instance lock: the pid-file guard has a TOCTOU race (two
     # starters both seeing no live pid), and two live bots mean a nick
     # collision (Newton_) plus echoed posts. Held for the whole process
